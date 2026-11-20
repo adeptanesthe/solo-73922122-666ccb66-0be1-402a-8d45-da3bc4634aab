@@ -24,7 +24,7 @@
   .card h2 { margin: 0 0 12px; font-size: 14px; letter-spacing: .04em;
              color: var(--muted); text-transform: uppercase; }
   label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
-  input[type=number], textarea, select {
+  input[type=number], input[type=text], textarea, select {
     width: 100%; background: #0c111b; color: var(--text); border: 1px solid var(--line);
     border-radius: 7px; padding: 8px 10px; font-size: 13px; font-family: ui-monospace,
     SFMono-Regular, Menlo, monospace;
@@ -79,8 +79,9 @@
       <h2>输入</h2>
       <div class="row">
         <div>
-          <label for="seed">随机种子 seed</label>
-          <input id="seed" type="number" value="20240517" step="1" />
+          <label for="seed">随机种子 seed（0 – 9223372036854775807）</label>
+          <input id="seed" type="text" inputmode="numeric" value="20240517"
+                 spellcheck="false" autocomplete="off" />
         </div>
         <div>
           <label for="scale">权重倍率 scale（0.1–100）</label>
@@ -147,6 +148,9 @@
 <script>
 const IGNORE = -100;
 const MAX_TOTAL = 128;
+// Seeds are 63-bit: beyond 2^53 a JS Number cannot hold them exactly, so the
+// seed is validated with BigInt and submitted as a decimal string.
+const SEED_MAX = 9223372036854775807n;
 const $ = (id) => document.getElementById(id);
 let samplesCache = [];
 
@@ -212,13 +216,25 @@ function recount() {
   }
 }
 
+function parseSeedInput() {
+  const raw = $("seed").value.trim();
+  if (!/^[+-]?\d+$/.test(raw)) {
+    throw new Error(`种子 seed 必须是十进制整数（0 到 ${SEED_MAX}），收到「${raw}」`);
+  }
+  const value = BigInt(raw);
+  if (value < 0n || value > SEED_MAX) {
+    throw new Error(`种子 seed 越界：${raw}（允许 0 到 ${SEED_MAX}）`);
+  }
+  return value.toString(10); // 规范十进制串，逐位提交，不经过 Number
+}
+
 function collectPayload() {
   const batches = [...document.querySelectorAll(".mb")].map((wrap, idx) => ({
     name: wrap.querySelector(".mb-name").value.trim() || `mb${idx + 1}`,
     tokens: parseBatchArea(wrap.querySelector(".mb-tokens").value),
   }));
   return {
-    seed: Number($("seed").value),
+    seed: parseSeedInput(),
     scale: Number($("scale").value),
     vocab_size: Number($("vocab").value),
     microbatches: batches,
@@ -231,14 +247,46 @@ function fmt(x) {
   return x.toPrecision(12);
 }
 
-function render(report) {
-  $("raw").textContent = JSON.stringify(report, null, 2);
+// Pretty-print JSON text without reinterpreting number literals, so integer
+// seeds beyond 2^53 keep every digit in the raw report view.
+function prettyJsonRaw(text) {
+  const out = [];
+  let depth = 0, inStr = false, esc = false;
+  const nl = () => "\n" + "  ".repeat(depth);
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inStr) {
+      out.push(ch);
+      if (esc) esc = false;
+      else if (ch === "\\") esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') { inStr = true; out.push(ch); }
+    else if (ch === "{" || ch === "[") {
+      const next = text[i + 1];
+      if ((ch === "{" && next === "}") || (ch === "[" && next === "]")) {
+        out.push(ch + next); i++;
+      } else { depth++; out.push(ch + nl()); }
+    }
+    else if (ch === "}" || ch === "]") { depth--; out.push(nl() + ch); }
+    else if (ch === ",") out.push(ch + nl());
+    else if (ch === ":") out.push(": ");
+    else if (ch !== " " && ch !== "\n" && ch !== "\t" && ch !== "\r") out.push(ch);
+  }
+  return out.join("");
+}
+
+function render(report, rawText) {
+  $("raw").textContent = rawText ? prettyJsonRaw(rawText) : JSON.stringify(report, null, 2);
   const verdict = $("verdict");
   verdict.textContent = report.message;
   verdict.className = "verdict " + (report.ok ? "pass" : "fail");
   const c = report.config;
+  const seedShown = c.seed_text !== undefined ? c.seed_text : String(c.seed);
   $("summary").innerHTML = `
     <table><tbody>
+      <tr><th>随机种子</th><td class="num">${seedShown}</td></tr>
       <tr><th>词表 / 嵌入维度</th><td class="num">${c.vocab_size} × 16</td></tr>
       <tr><th>有效 token / 总数</th><td class="num">${c.valid_tokens} / ${c.total_tokens}</td></tr>
       <tr><th>自定义损失</th><td class="num">${fmt(report.chunked.loss)}</td></tr>
@@ -290,12 +338,15 @@ async function run() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
-    const body = await resp.json();
+    const text = await resp.text();
+    let body;
+    try { body = JSON.parse(text); }
+    catch (e) { throw new Error(`响应不是合法 JSON（HTTP ${resp.status}）`); }
     if (!resp.ok) {
       const detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
       throw new Error(detail || `HTTP ${resp.status}`);
     }
-    render(body);
+    render(body, text);
     $("status").textContent = `完成 · ${body.ok ? "通过" : "未通过"}`;
     $("status").className = "pill " + (body.ok ? "ok" : "bad");
   } catch (e) {
@@ -329,7 +380,7 @@ async function loadSamples() {
 }
 
 function applySample(sample) {
-  $("seed").value = sample.payload.seed;
+  $("seed").value = String(sample.payload.seed);
   $("scale").value = sample.payload.scale;
   $("vocab").value = sample.payload.vocab_size;
   $("batches").innerHTML = "";

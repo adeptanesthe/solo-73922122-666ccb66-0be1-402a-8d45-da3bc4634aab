@@ -41,6 +41,8 @@ MIN_SCALE = 0.1
 MAX_SCALE = 100.0
 TOLERANCE = 1e-8
 MAX_SEED = 2**63 - 1
+_SEED32_SPACE = 2**32
+_UINT64_MASK = 2**64 - 1
 
 
 class ValidationError(ValueError):
@@ -188,10 +190,33 @@ def parse_payload(payload: dict) -> RunSpec:
 # ---------------------------------------------------------------------------
 # Parameter construction
 # ---------------------------------------------------------------------------
+def _splitmix64(value: int) -> int:
+    """Bijective 64-bit avalanche mix (splitmix64 offset + finaliser)."""
+    z = (value + 0x9E3779B97F4A7C15) & _UINT64_MASK
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & _UINT64_MASK
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & _UINT64_MASK
+    return (z ^ (z >> 31)) & _UINT64_MASK
+
+
+def generator_seed(seed: int) -> int:
+    """Map a user seed in ``[0, 2**63)`` to the ``torch.Generator`` seed.
+
+    The CPU MT19937 engine behind ``torch.Generator`` only consumes the low
+    32 bits of the seed, so raw seeds that differ solely in bits >= 32 (e.g.
+    ``7`` and ``7 + 2**32``) would produce identical weights.  Seeds below
+    ``2**32`` are passed through unchanged so historical weights are
+    reproduced exactly; larger seeds are folded through splitmix64 so every
+    bit of the 63-bit seed influences the 32 bits the engine actually uses.
+    """
+    if 0 <= seed < _SEED32_SPACE:
+        return seed
+    return _splitmix64(seed)
+
+
 def make_weight(vocab_size: int, seed: int, scale: float) -> torch.Tensor:
     """Standard-normal float64 ``W`` from ``seed``, multiplied by ``scale``."""
     gen = torch.Generator(device="cpu")
-    gen.manual_seed(int(seed))
+    gen.manual_seed(generator_seed(int(seed)))
     weight = torch.randn(vocab_size, EMBED_DIM, generator=gen, dtype=torch.float64)
     return weight * scale
 
@@ -520,6 +545,10 @@ def evaluate(payload: dict) -> dict:
             "vocab_size": spec.vocab_size,
             "embed_dim": EMBED_DIM,
             "seed": spec.seed,
+            # Decimal string twin of ``seed``: JSON numbers lose integer
+            # precision beyond 2**53 in many clients (e.g. browsers), so the
+            # exact seed is also reported as text.
+            "seed_text": str(spec.seed),
             "scale": spec.scale,
             "learning_rate": LEARNING_RATE,
             "microbatches": len(spec.microbatches),

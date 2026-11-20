@@ -15,8 +15,20 @@
 * 网页录入 1–4 个微批（总计 ≤128 token），显示**损失 / 共享 W 梯度 / 更新后权重**
   三项对照误差，全部 ≤1e-8 才显示“通过”；同时验证把同一 token 流重新拆成
   1–4 个微批时损失、梯度、更新后权重不变。
-* 内置三个样例：重复 token、不等有效长度（含整批被忽略）、大分数（scale=100，
-  词表 4096）。
+* 内置四个样例：重复 token、不等有效长度（含整批被忽略）、大分数（scale=100，
+  词表 4096）、大种子（9007199254740993 = 2⁵³+1，演示种子逐位提交与高比特参与）。
+
+## 种子处理
+
+* 种子合法范围为 0 … 2⁶³−1；越界（含负数）一律 422 拒绝，不做任何参数更新。
+* PyTorch CPU 的 MT19937 引擎只使用 `manual_seed` 值的**低 32 位**，直接把
+  种子传入会让 7 与 7+2³² 生成完全相同的 W。为此引擎在播种前做一层映射：
+  * 0 … 2³²−1：**恒等映射**，与历史实现逐位一致，旧权重完全复现；
+  * ≥ 2³²：经 splitmix64（双射雪崩混合）折叠到 64 位，使种子的每一比特
+    都影响引擎实际使用的低 32 位，仅高位不同的种子（如 7 与 4294967303、
+    9007199254740992 与 9007199254740993）会产生不同的初始权重。
+* 分块实现、稠密参考与每次微批拆分都从同一份由该种子生成的 float64
+  初始权重起算；同一配置重跑结果逐位一致。
 
 ## 快速开始
 
@@ -33,7 +45,7 @@ docker compose up --build
 | --- | --- |
 | `GET /` | 录入界面 |
 | `GET /healthz` | 健康检查（Compose healthcheck 使用） |
-| `GET /api/samples` | 三个内置样例 |
+| `GET /api/samples` | 四个内置样例 |
 | `POST /api/run` | 运行对照，返回 JSON 报告 |
 
 ### 本地运行
@@ -62,8 +74,11 @@ python3 -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 }
 ```
 
-* `seed`：0 … 2⁶³−1 的整数；`torch.Generator` 固定种子生成
-  `randn(vocab_size, 16, dtype=float64)`。
+* `seed`：0 … 2⁶³−1（9223372036854775807）的整数，越界拒绝（422）。
+  API 接受 JSON 整数或十进制字符串（如 `"seed": "9007199254740993"`），
+  两者逐位等价；网页表单以字符串提交并用 BigInt 校验，避免 JS `Number`
+  在 2⁵³ 以上丢精度。报告中的 `config.seed` 为 JSON 整数，
+  `config.seed_text` 为其十进制字符串副本，网页按字符串逐位显示。
 * `scale`：0.1 … 100（权重倍率）。
 * `vocab_size`：256 … 4096；嵌入维度固定 16。
 * `microbatches`：1 … 4 个；每项 `tokens` 为 `[输入号, 目标号]` 列表。
@@ -81,6 +96,7 @@ python3 -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 {
   "ok": true,
   "tolerance": 1e-8,
+  "config":  { "seed": 20240517, "seed_text": "20240517", "vocab_size": 256, ... },
   "chunked": { "loss": 25.70, "grad_norm": 6.84, "weight_norm": 63.94 },
   "dense":   { "loss": 25.70, "grad_norm": 6.84, "weight_norm": 63.94 },
   "errors":  { "loss_abs_diff": 3.6e-15, "grad_max_abs_diff": 2.6e-15,
@@ -106,7 +122,7 @@ python3 -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 app/engine.py       校验、W 生成、自定义 autograd、稠密参考、对照报告
 app/main.py         FastAPI 路由
 app/static/index.html  录入与结果界面（无外部依赖）
-app/samples.py      三个必备样例
+app/samples.py      四个必备样例
 tests/test_engine.py   数值/约束/内存行为测试
 tests/test_api.py      HTTP 层测试
 ```

@@ -16,11 +16,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.engine import (  # noqa: E402
     IGNORE_INDEX,
+    MAX_SEED,
     MAX_VOCAB_CHUNK,
     TOLERANCE,
     ChunkedSoftmaxLoss,
     ValidationError,
     evaluate,
+    generator_seed,
     make_weight,
     parse_payload,
     run_chunked,
@@ -45,6 +47,75 @@ def test_deterministic_weight_from_seed():
     assert a.dtype == torch.float64 and a.shape == (256, 16)
     scaled = make_weight(256, 1234, 2.5)
     assert torch.allclose(scaled, a * 2.5, rtol=0, atol=0)
+
+
+def _legacy_weight(vocab_size, seed, scale):
+    """Pre-fix behaviour: the raw seed went straight to torch.Generator."""
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(int(seed))
+    return torch.randn(vocab_size, 16, generator=gen, dtype=torch.float64) * scale
+
+
+def test_small_seeds_reproduce_legacy_weights():
+    # Backward compatibility: every seed in [0, 2**32) must generate exactly
+    # the weights the pre-fix implementation produced.
+    for seed in (0, 1, 7, 991, 20240517, 424242, 2**32 - 1):
+        assert generator_seed(seed) == seed
+        assert torch.equal(make_weight(256, seed, 1.0), _legacy_weight(256, seed, 1.0))
+        assert torch.equal(make_weight(300, seed, 2.5), _legacy_weight(300, seed, 2.5))
+
+
+def test_high_bit_seeds_produce_different_weights():
+    # The CPU generator alone would truncate seeds to 32 bits; the engine must
+    # fold the high bits in so that seeds differing only above bit 32 differ.
+    base = make_weight(256, 7, 1.0)
+    for seed in (7 + 2**32, 7 + 2 * 2**32, 7 + 2**33, 7 + 2**62,
+                 9007199254740992, 9007199254740993, MAX_SEED):
+        assert not torch.equal(base, make_weight(256, seed, 1.0)), seed
+    assert not torch.equal(
+        make_weight(256, 7 + 2**32, 1.0), make_weight(256, 7 + 2**33, 1.0)
+    )
+    # 9007199254740993 must not collapse onto its low 32 bits (i.e. seed 1).
+    assert not torch.equal(make_weight(256, 9007199254740993, 1.0), make_weight(256, 1, 1.0))
+
+
+def test_large_seed_deterministic_and_scaled():
+    a = make_weight(512, 9007199254740993, 1.0)
+    b = make_weight(512, 9007199254740993, 1.0)
+    assert torch.equal(a, b)
+    assert a.dtype == torch.float64
+    scaled = make_weight(512, 9007199254740993, 3.5)
+    assert torch.allclose(scaled, a * 3.5, rtol=0, atol=0)
+
+
+def test_seed_string_parsed_exactly_and_bounds_enforced():
+    spec = parse_payload(_payload([[1, 2]], seed="9007199254740993"))
+    assert spec.seed == 9007199254740993
+    spec = parse_payload(_payload([[1, 2]], seed=str(MAX_SEED)))
+    assert spec.seed == MAX_SEED
+    spec = parse_payload(_payload([[1, 2]], seed=" 42 "))
+    assert spec.seed == 42
+    for bad in (-1, MAX_SEED + 1, "-1", str(MAX_SEED + 1), "9223372036854775808"):
+        with pytest.raises(ValidationError):
+            parse_payload(_payload([[1, 2]], seed=bad))
+
+
+def test_evaluate_with_large_seed_passes_and_is_deterministic():
+    payload = _payload([[1, 2], [3, 4], [5, IGNORE_INDEX], [7, 8]],
+                       seed=9007199254740993, scale=2.0, vocab=512)
+    first = evaluate(payload)
+    second = evaluate(payload)
+    assert first["ok"], first["errors"]
+    assert first["config"]["seed"] == 9007199254740993
+    assert first["config"]["seed_text"] == "9007199254740993"
+    assert first["chunked"]["loss"] == second["chunked"]["loss"]
+    assert first["dense"]["grad_norm"] == second["dense"]["grad_norm"]
+    # Chunked, dense and every split start from the same float64 weights:
+    # all cross-checks stay within the original 1e-8 tolerance.
+    for key in ("loss_abs_diff", "grad_max_abs_diff", "weight_max_abs_diff"):
+        assert first["errors"][key] <= TOLERANCE
+    for key in ("max_loss_diff", "max_grad_diff", "max_weight_diff"):
+        assert first["split"][key] <= TOLERANCE
 
 
 def test_weight_tying_is_shared():
